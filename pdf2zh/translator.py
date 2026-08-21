@@ -181,6 +181,7 @@ class GoogleTranslator(BaseTranslator):
             self.endpoint,
             params={"tl": self.lang_out, "sl": self.lang_in, "q": text},
             headers=self.headers,
+            timeout=30,
         )
         re_result = re.findall(
             r'(?s)class="(?:t0|result-container)">(.*?)<', response.text
@@ -207,7 +208,7 @@ class BingTranslator(BaseTranslator):
         }
 
     def find_sid(self):
-        response = self.session.get(self.endpoint)
+        response = self.session.get(self.endpoint, timeout=30)
         response.raise_for_status()
         url = response.url[:-10]
         ig = re.findall(r"\"ig\":\"(.*?)\"", response.text)[0]
@@ -230,6 +231,7 @@ class BingTranslator(BaseTranslator):
                 "key": key,
             },
             headers=self.headers,
+            timeout=30,
         )
         response.raise_for_status()
         return response.json()[0]["translations"][0]["text"]
@@ -287,6 +289,7 @@ class DeepLXTranslator(BaseTranslator):
                 "text": text,
             },
             verify=False,  # noqa: S506
+            timeout=30,
         )
         response.raise_for_status()
         return response.json()["data"]

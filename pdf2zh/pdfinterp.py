@@ -38,6 +38,21 @@ from pdfminer.utils import (
     apply_matrix_pt,
 )
 
+
+def pdf_number(value: object) -> str:
+    """Serialize a numeric operand using syntax accepted by PDF readers.
+
+    Python uses scientific notation for sufficiently small floats, but the PDF
+    grammar only permits integer and fixed-point real tokens. Matrix inversion
+    can produce values close to zero, so normalize those values explicitly.
+    """
+    if isinstance(value, int):
+        return str(value)
+    number = f"{float(value):.15f}".rstrip("0").rstrip(".")
+    if number in {"", "-0"}:
+        return "0"
+    return number
+
 log = logging.getLogger(__name__)
 
 
@@ -238,8 +253,11 @@ class PDFPageInterpreterEx(PDFPageInterpreter):
                     pos_inv = -np.mat(ctm[4:]) * ctm_inv
                 a, b, c, d = ctm_inv.reshape(4).tolist()
                 e, f = pos_inv.tolist()[0]
+                inverse_matrix = " ".join(
+                    pdf_number(value) for value in (a, b, c, d, e, f)
+                )
                 self.obj_patch[self.xobjmap[xobjid].objid] = (
-                    f"q {ops_base}Q {a} {b} {c} {d} {e} {f} cm {ops_new}"
+                    f"q {ops_base}Q {inverse_matrix} cm {ops_new}"
                 )
             except Exception:
                 pass
@@ -272,7 +290,7 @@ class PDFPageInterpreterEx(PDFPageInterpreter):
         ops_new = self.device.end_page(page)
         # 上面渲染的时候会根据 cropbox 减掉页面偏移得到真实坐标，这里输出的时候需要用 cm 把页面偏移加回来
         self.obj_patch[page.page_xref] = (
-            f"q {ops_base}Q 1 0 0 1 {x0} {y0} cm {ops_new}"  # ops_base 里可能有图，需要让 ops_new 里的文字覆盖在上面，使用 q/Q 重置位置矩阵
+            f"q {ops_base}Q 1 0 0 1 {pdf_number(x0)} {pdf_number(y0)} cm {ops_new}"  # ops_base 里可能有图，需要让 ops_new 里的文字覆盖在上面，使用 q/Q 重置位置矩阵
         )
         for obj in page.contents:
             self.obj_patch[obj.objid] = ""

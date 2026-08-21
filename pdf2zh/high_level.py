@@ -186,7 +186,14 @@ def translate_stream(
     ignore_cache: bool = False,
     **kwarg: Any,
 ):
-    font_list = [("tiro", None)]
+    # Base-14 Latin fonts used to preserve paragraph emphasis in translated
+    # text without depending on machine-specific font files.
+    font_list = [
+        ("tiro", None),
+        ("tibo", None),
+        ("tiit", None),
+        ("tibi", None),
+    ]
 
     font_path = download_remote_fonts(lang_out.lower())
     noto_name = NOTO_NAME

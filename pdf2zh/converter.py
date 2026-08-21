@@ -1,4 +1,5 @@
 import concurrent.futures
+import builtins
 import logging
 import re
 import unicodedata
@@ -13,7 +14,7 @@ from pdfminer.pdffont import PDFCIDFont, PDFUnicodeNotDefined
 from pdfminer.pdfinterp import PDFGraphicState, PDFResourceManager
 from pdfminer.utils import apply_matrix_pt, mult_matrix
 from pymupdf import Font
-from tenacity import retry, wait_fixed
+from tenacity import retry, stop_after_attempt, wait_fixed
 
 from pdf2zh.translator import (
     AnythingLLMTranslator,
@@ -117,7 +118,19 @@ class PDFConverterEx(PDFConverter):
 
 
 class Paragraph:
-    def __init__(self, y, x, x0, x1, y0, y1, size, brk):
+    def __init__(
+        self,
+        y,
+        x,
+        x0,
+        x1,
+        y0,
+        y1,
+        size,
+        brk,
+        font_style="regular",
+        color=(0.0,),
+    ):
         self.y: float = y  # 初始纵坐标
         self.x: float = x  # 初始横坐标
         self.x0: float = x0  # 左边界
@@ -126,6 +139,33 @@ class Paragraph:
         self.y1: float = y1  # 下边界
         self.size: float = size  # 字体大小
         self.brk: bool = brk  # 换行标记
+        self.font_style: str = font_style
+        self.color = color
+        # Character offsets where the source PDF explicitly started a new
+        # line. Translation must not collapse these author-supplied breaks.
+        self.break_positions: list[int] = []
+
+
+TOC_ENTRY_RE = re.compile(
+    r"^(?P<label>.*?)(?P<leaders>\.{4,})(?P<page>\s*\d+\s*)$",
+    re.DOTALL,
+)
+CODE_LINE_RE = re.compile(r"^N\d+\b", re.IGNORECASE)
+TECHNICAL_BOLD_TOKEN_RE = re.compile(
+    r"(?:\d+(?:[.,]\d+)*|\.[A-Za-z0-9]+|[GMNT]\d+(?:[.,]\d+)*)",
+    re.IGNORECASE,
+)
+BULLET_GLYPHS = frozenset("•◦▪▫‣⁃➢➤➔→►▸")
+
+
+def is_fixed_layout_line(text: str) -> bool:
+    """Return True for rows whose coordinates carry semantic meaning."""
+    stripped = text.strip()
+    return bool(
+        TOC_ENTRY_RE.match(stripped)
+        or CODE_LINE_RE.match(stripped)
+        or (stripped.startswith("{") and stripped.endswith("}"))
+    )
 
 
 # fmt: off
@@ -188,6 +228,84 @@ class TranslateConverter(PDFConverterEx):
         vmax: float = ltpage.width / 4  # 行内公式最大宽度
         ops: str = ""                   # 渲染结果
 
+        def font_style_for(font_name: str) -> str:
+            source_font = str(font_name).lower()
+            is_bold = "bold" in source_font
+            is_italic = "italic" in source_font or "oblique" in source_font
+            if is_bold and is_italic:
+                return "bold_italic"
+            if is_bold:
+                return "bold"
+            if is_italic:
+                return "italic"
+            return "regular"
+
+        def source_color(char: LTChar):
+            color = getattr(getattr(char, "graphicstate", None), "ncolor", None)
+            if color is None:
+                return (0.0,)
+            if isinstance(color, (int, float)):
+                return (float(color),)
+            try:
+                return tuple(float(component) for component in color)
+            except (TypeError, ValueError):
+                return (0.0,)
+
+        # Preformatted machine listings encode meaning in exact x/y positions.
+        # Mark their original glyphs for positional preservation instead of
+        # reconstructing them with a wider fallback font.
+        fixed_layout_char_ids: set[int] = set()
+        technical_bold_tokens: dict[str, str] = {}
+        current_line: list[LTChar] = []
+
+        def finish_source_line() -> None:
+            if not current_line:
+                return
+            line_text = "".join(char.get_text() for char in current_line).strip()
+            if CODE_LINE_RE.match(line_text) or (
+                line_text.startswith("{") and line_text.endswith("}")
+            ):
+                fixed_layout_char_ids.update(builtins.id(char) for char in current_line)
+                return
+
+            # Record inline emphasis separately from coordinate-locked text.
+            # Values such as 35, .din and G99 remain part of the sentence sent
+            # to the translator, then regain their original emphasis when the
+            # translated paragraph is rendered.
+            token_chars: list[LTChar] = []
+
+            def finish_token() -> None:
+                if not token_chars:
+                    return
+                token = "".join(char.get_text() for char in token_chars)
+                styles = {font_style_for(char.fontname) for char in token_chars}
+                if TECHNICAL_BOLD_TOKEN_RE.fullmatch(token) and any(
+                    "bold" in style for style in styles
+                ):
+                    style = next(
+                        style for style in styles if "bold" in style
+                    )
+                    technical_bold_tokens[token] = style
+
+            for line_char in current_line:
+                if line_char.get_text().isspace():
+                    finish_token()
+                    token_chars = []
+                else:
+                    token_chars.append(line_char)
+            finish_token()
+
+        previous_line_char: LTChar | None = None
+        for source_child in ltpage:
+            if not isinstance(source_child, LTChar):
+                continue
+            if previous_line_char is not None and source_child.x1 < previous_line_char.x0:
+                finish_source_line()
+                current_line = []
+            current_line.append(source_child)
+            previous_line_char = source_child
+        finish_source_line()
+
         def vflag(font: str, char: str):    # 匹配公式（和角标）字体
             if isinstance(font, bytes):     # 不一定能 decode，直接转 str
                 try:
@@ -203,7 +321,7 @@ class TranslateConverter(PDFConverterEx):
                     return True
             else:
                 if re.match(                                            # latex 字体
-                    r"(CM[^R]|MS.M|XY|MT|BL|RM|EU|LA|RS|LINE|LCIRCLE|TeX-|rsfs|txsy|wasy|stmary|.*Mono|.*Code|.*Ital|.*Sym|.*Math)",
+                    r"(CM[^R]|MS.M|XY|MT|BL|RM|EU|LA|RS|LINE|LCIRCLE|TeX-|rsfs|txsy|wasy|stmary|.*Mono|.*Code|.*Sym|.*Math|.*Wingdings|.*Webdings|.*Dingbats)",
                     font,
                 ):
                     return True
@@ -235,12 +353,15 @@ class TranslateConverter(PDFConverterEx):
                 # 读取当前字符在 layout 中的类别
                 cx, cy = np.clip(int(child.x0), 0, w - 1), np.clip(int(child.y0), 0, h - 1)
                 cls = layout[cy, cx]
+                if builtins.id(child) in fixed_layout_char_ids:
+                    cls = -1000
                 # 锚定文档中 bullet 的位置
-                if child.get_text() == "•":
+                if child.get_text() in BULLET_GLYPHS:
                     cls = 0
                 # 判定当前字符是否属于公式
                 if (                                                                                        # 判定当前字符是否属于公式
                     cls == 0                                                                                # 1. 类别为保留区域
+                    or builtins.id(child) in fixed_layout_char_ids                                          # 1b. preformatted source row
                     or (cls == xt_cls and len(sstk[-1].strip()) > 1 and child.size < pstk[-1].size * 0.79)  # 2. 角标字体，有 0.76 的角标和 0.799 的大写，这里用 0.79 取中，同时考虑首字母放大的情况
                     or vflag(child.fontname, child.get_text())                                              # 3. 公式字体
                     or (child.matrix[0] == 0 and child.matrix[3] == 0)                                      # 4. 垂直字体
@@ -284,12 +405,34 @@ class TranslateConverter(PDFConverterEx):
                     if cls == xt_cls:               # 当前字符与前一个字符属于同一段落
                         if child.x0 > xt.x1 + 1:    # 添加行内空格
                             sstk[-1] += " "
-                        elif child.x1 < xt.x0:      # 添加换行空格并标记原文段落存在换行
-                            sstk[-1] += " "
-                            pstk[-1].brk = True
+                        elif child.x1 < xt.x0:      # 原文换行
+                            # A table-of-contents row is an independently
+                            # positioned record. Merging rows into a paragraph
+                            # lets translation move page numbers and leaders
+                            # into later lines, destroying the original layout.
+                            if is_fixed_layout_line(sstk[-1]):
+                                sstk.append("")
+                                pstk.append(
+                                    Paragraph(
+                                        child.y0,
+                                        child.x0,
+                                        child.x0,
+                                        child.x0,
+                                        child.y0,
+                                        child.y1,
+                                        child.size,
+                                        False,
+                                        font_style_for(child.fontname),
+                                        source_color(child),
+                                    )
+                                )
+                            else:
+                                pstk[-1].break_positions.append(len(sstk[-1]))
+                                sstk[-1] += " "
+                                pstk[-1].brk = True
                     else:                           # 根据当前字符构建一个新的段落
                         sstk.append("")
-                        pstk.append(Paragraph(child.y0, child.x0, child.x0, child.x0, child.y0, child.y1, child.size, False))
+                        pstk.append(Paragraph(child.y0, child.x0, child.x0, child.x0, child.y0, child.y1, child.size, False, font_style_for(child.fontname), source_color(child)))
                 if not cur_v:                                               # 文字入栈
                     if (                                                    # 根据当前字符修正段落属性
                         child.size > pstk[-1].size                          # 1. 当前字符比段落字体大
@@ -340,17 +483,64 @@ class TranslateConverter(PDFConverterEx):
             l = max([vch.x1 for vch in v]) - v[0].x0
             log.debug(f'< {l:.1f} {v[0].x0:.1f} {v[0].y0:.1f} {v[0].cid} {v[0].fontname} {len(varl[id])} > v{id} = {"".join([ch.get_text() for ch in v])}')
             vlen.append(l)
-
         ############################################################
         # B. 段落翻译
         log.debug("\n==========[SSTACK]==========\n")
 
-        @retry(wait=wait_fixed(1))
-        def worker(s: str):  # 多线程翻译
+        latin_fonts = {
+            "regular": "tiro",
+            "bold": "tibo",
+            "italic": "tiit",
+            "bold_italic": "tibi",
+        }
+
+        def rendered_width(text: str, size: float, latin_font: str = "tiro") -> float:
+            width = 0.0
+            for char in text:
+                try:
+                    if self.fontmap[latin_font].to_unichr(ord(char)) == char:
+                        width += self.fontmap[latin_font].char_width(ord(char)) * size
+                    else:
+                        width += self.noto.char_lengths(char, size)[0]
+                except Exception:
+                    width += size * 0.5
+            return width
+
+        @retry(wait=wait_fixed(1), stop=stop_after_attempt(3), reraise=True)
+        def worker(item):  # 多线程翻译
+            paragraph_id, s = item
             if not s.strip() or re.match(r"^\{v\d+\}$", s):  # 空白和公式不翻译
                 return s
             try:
-                new = self.translator.translate(s)
+                # Machine programs and metadata are position-sensitive. Keep
+                # commands/placeholders byte-for-byte so highlights and
+                # aligned comments stay attached to the correct source row.
+                if CODE_LINE_RE.match(s.strip()) or (
+                    s.strip().startswith("{") and s.strip().endswith("}")
+                ):
+                    return s
+                toc_entry = TOC_ENTRY_RE.match(s.strip())
+                if toc_entry:
+                    # Translate only the label. Rebuild the leader so the page
+                    # number remains anchored at the original right boundary.
+                    label = toc_entry.group("label").rstrip()
+                    page_number = toc_entry.group("page").strip()
+                    translated_label = self.translator.translate(label).strip()
+                    paragraph = pstk[paragraph_id]
+                    latin_font = latin_fonts[paragraph.font_style]
+                    available = paragraph.x1 - paragraph.x0
+                    fixed_width = rendered_width(
+                        f"{translated_label}  {page_number}",
+                        paragraph.size,
+                        latin_font,
+                    )
+                    dot_width = max(
+                        rendered_width(".", paragraph.size, latin_font), 0.1
+                    )
+                    dot_count = max(4, int((available - fixed_width) / dot_width))
+                    new = f"{translated_label} {'.' * dot_count} {page_number}"
+                else:
+                    new = self.translator.translate(s)
                 return new
             except BaseException as e:
                 if log.isEnabledFor(logging.DEBUG):
@@ -361,7 +551,63 @@ class TranslateConverter(PDFConverterEx):
         with concurrent.futures.ThreadPoolExecutor(
             max_workers=self.thread
         ) as executor:
-            news = list(executor.map(worker, sstk))
+            news = list(executor.map(worker, enumerate(sstk)))
+
+        def restore_source_breaks(text: str, paragraph_id: int) -> str:
+            """Map explicit source line feeds to nearby target-language spaces."""
+            break_positions = pstk[paragraph_id].break_positions
+            source = sstk[paragraph_id]
+            if not break_positions or not source or not text:
+                return text
+
+            # Translator-provided line endings are normalized first; the
+            # source PDF remains the authority for the number of hard lines.
+            normalized = re.sub(r"\s+", " ", text).strip()
+            if not normalized:
+                return text
+            whitespace_positions = [
+                match.start() for match in re.finditer(r" ", normalized)
+            ]
+            if not whitespace_positions:
+                return normalized
+
+            chosen: list[int] = []
+            source_length = max(len(source), 1)
+            for source_position in break_positions:
+                target = round(source_position / source_length * len(normalized))
+                candidates = [
+                    position
+                    for position in whitespace_positions
+                    if position not in chosen
+                    and (not chosen or position > chosen[-1])
+                ]
+                if not candidates:
+                    break
+                chosen.append(min(candidates, key=lambda position: abs(position - target)))
+
+            for position in reversed(chosen):
+                normalized = normalized[:position] + "\n" + normalized[position + 1:]
+            return normalized
+
+        def restore_placeholder_spacing(text: str) -> str:
+            """Keep protected glyph runs separated from translated words."""
+            marker = r"\{\s*v[\d\s]+\}"
+            text = re.sub(rf"(?<=\w)(?={marker})", " ", text, flags=re.IGNORECASE)
+            text = re.sub(
+                rf"({marker})(?=\w)",
+                r"\1 ",
+                text,
+                flags=re.IGNORECASE,
+            )
+            return text
+
+        news = [
+            restore_source_breaks(
+                restore_placeholder_spacing(new),
+                paragraph_id,
+            )
+            for paragraph_id, new in enumerate(news)
+        ]
 
         ############################################################
         # C. 新文档排版
@@ -382,8 +628,23 @@ class TranslateConverter(PDFConverterEx):
         _x, _y = 0, 0
         ops_list = []
 
-        def gen_op_txt(font, size, x, y, rtxt):
-            return f"/{font} {size:f} Tf 1 0 0 1 {x:f} {y:f} Tm [<{rtxt}>] TJ "
+        def color_operator(color) -> str:
+            if color is None:
+                return "0 g "
+            try:
+                components = tuple(float(component) for component in color)
+            except (TypeError, ValueError):
+                return "0 g "
+            if len(components) == 1:
+                return f"{components[0]:f} g "
+            if len(components) == 3:
+                return " ".join(f"{component:f}" for component in components) + " rg "
+            if len(components) == 4:
+                return " ".join(f"{component:f}" for component in components) + " k "
+            return "0 g "
+
+        def gen_op_txt(font, size, x, y, rtxt, color):
+            return f"{color_operator(color)}/{font} {size:f} Tf 1 0 0 1 {x:f} {y:f} Tm [<{rtxt}>] TJ "
 
         def gen_op_line(x, y, xlen, ylen, linewidth):
             return f"ET q 1 0 0 1 {x:f} {y:f} cm [] 0 d 0 J {linewidth:f} w 0 0 m {xlen:f} {ylen:f} l S Q BT "
@@ -402,11 +663,44 @@ class TranslateConverter(PDFConverterEx):
             tx = x
             fcur_ = fcur
             ptr = 0
+            latin_font = latin_fonts[pstk[id].font_style]
             log.debug(f"< {y} {x} {x0} {x1} {size} {brk} > {sstk[id]} | {new}")
+
+            inline_style_positions: dict[int, str] = {}
+            for token, style in sorted(
+                technical_bold_tokens.items(),
+                key=lambda item: len(item[0]),
+                reverse=True,
+            ):
+                token_pattern = re.compile(
+                    rf"(?<!\w){re.escape(token)}(?!\w)",
+                    re.IGNORECASE,
+                )
+                for match in token_pattern.finditer(new):
+                    for position in range(match.start(), match.end()):
+                        inline_style_positions[position] = style
 
             ops_vals: list[dict] = []
 
             while ptr < len(new):
+                if new[ptr] == "\n":
+                    if cstk:
+                        ops_vals.append({
+                            "type": OpType.TEXT,
+                            "font": fcur,
+                            "size": size,
+                            "x": tx,
+                            "dy": 0,
+                            "rtxt": raw_string(fcur, cstk),
+                            "lidx": lidx,
+                            "color": pstk[id].color,
+                        })
+                        cstk = ""
+                    ptr += 1
+                    x = x0
+                    lidx += 1
+                    fcur = None
+                    continue
                 vy_regex = re.match(
                     r"\{\s*v([\d\s]+)\}", new[ptr:], re.IGNORECASE
                 )  # 匹配 {vn} 公式标记
@@ -422,10 +716,13 @@ class TranslateConverter(PDFConverterEx):
                         mod = var[vid][-1].width
                 else:  # 加载文字
                     ch = new[ptr]
+                    active_latin_font = latin_fonts[
+                        inline_style_positions.get(ptr, pstk[id].font_style)
+                    ]
                     fcur_ = None
                     try:
-                        if fcur_ is None and self.fontmap["tiro"].to_unichr(ord(ch)) == ch:
-                            fcur_ = "tiro"  # 默认拉丁字体
+                        if fcur_ is None and self.fontmap[active_latin_font].to_unichr(ord(ch)) == ch:
+                            fcur_ = active_latin_font  # preserve source emphasis
                     except Exception:
                         pass
                     if fcur_ is None:
@@ -448,7 +745,8 @@ class TranslateConverter(PDFConverterEx):
                             "x": tx,
                             "dy": 0,
                             "rtxt": raw_string(fcur, cstk),
-                            "lidx": lidx
+                            "lidx": lidx,
+                            "color": pstk[id].color,
                         })
                         cstk = ""
                 if brk and x + adv > x1 + 0.1 * size:  # 到达右边界且原文段落存在换行
@@ -467,7 +765,8 @@ class TranslateConverter(PDFConverterEx):
                             "x": x + vch.x0 - var[vid][0].x0,
                             "dy": fix + vch.y0 - var[vid][0].y0,
                             "rtxt": raw_string(self.fontid[vch.font], vc),
-                            "lidx": lidx
+                            "lidx": lidx,
+                            "color": source_color(vch),
                         })
                         if log.isEnabledFor(logging.DEBUG):
                             lstk.append(LTLine(0.1, (_x, _y), (x + vch.x0 - var[vid][0].x0, fix + y + vch.y0 - var[vid][0].y0)))
@@ -507,7 +806,8 @@ class TranslateConverter(PDFConverterEx):
                     "x": tx,
                     "dy": 0,
                     "rtxt": raw_string(fcur, cstk),
-                    "lidx": lidx
+                    "lidx": lidx,
+                    "color": pstk[id].color,
                 })
 
             line_height = default_line_height
@@ -517,7 +817,7 @@ class TranslateConverter(PDFConverterEx):
 
             for vals in ops_vals:
                 if vals["type"] == OpType.TEXT:
-                    ops_list.append(gen_op_txt(vals["font"], vals["size"], vals["x"], vals["dy"] + y - vals["lidx"] * size * line_height, vals["rtxt"]))
+                    ops_list.append(gen_op_txt(vals["font"], vals["size"], vals["x"], vals["dy"] + y - vals["lidx"] * size * line_height, vals["rtxt"], vals["color"]))
                 elif vals["type"] == OpType.LINE:
                     ops_list.append(gen_op_line(vals["x"], vals["dy"] + y - vals["lidx"] * size * line_height, vals["xlen"], vals["ylen"], vals["linewidth"]))
 
