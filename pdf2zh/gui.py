@@ -2,52 +2,35 @@ import asyncio
 import cgi
 import os
 import shutil
-import socket
+import tempfile
 import uuid
 from asyncio import CancelledError
 from pathlib import Path
+from urllib.parse import quote
 import typing as T
 
 import gradio as gr
 import requests
 import tqdm
-from gradio_pdf import PDF
 from string import Template
 import logging
+import re
 
-from pdf2zh import __version__
 from pdf2zh.high_level import translate
 from pdf2zh.doclayout import ModelInstance
 from pdf2zh.config import ConfigManager
+from pdf2zh.kernel import KernelRegistry
 from pdf2zh.translator import (
-    AnythingLLMTranslator,
-    AzureOpenAITranslator,
-    AzureTranslator,
     BaseTranslator,
     BingTranslator,
-    DeepLTranslator,
     DeepLXTranslator,
-    DifyTranslator,
     ArgosTranslator,
-    GeminiTranslator,
     GoogleTranslator,
-    MiniMaxTranslator,
-    ModelScopeTranslator,
     OllamaTranslator,
-    OpenAITranslator,
-    SiliconTranslator,
-    TencentTranslator,
     XinferenceTranslator,
-    ZhipuTranslator,
-    GrokTranslator,
     GroqTranslator,
-    DeepseekTranslator,
-    OpenAIlikedTranslator,
-    QwenMtTranslator,
-    X302AITranslator,
 )
 from babeldoc.docvision.doclayout import OnnxModel
-from babeldoc import __version__ as babeldoc_version
 
 logger = logging.getLogger(__name__)
 
@@ -70,32 +53,161 @@ class _LazyModel:
 
 
 BABELDOC_MODEL = _LazyModel()
+PREVIEW_ROOT = Path(tempfile.gettempdir()) / "pdf2zh-previews"
+
+
+def pdf_preview_html(file_path):
+    """Render a server-hosted PDF with the browser's built-in viewer."""
+    if not file_path:
+        return '<div class="preview-placeholder">Upload a PDF to preview it.</div>'
+    source = Path(file_path).resolve()
+    preview_root = PREVIEW_ROOT.resolve()
+    try:
+        source.relative_to(preview_root)
+        preview_file = source
+    except ValueError:
+        preview_dir = preview_root / uuid.uuid4().hex
+        preview_dir.mkdir(parents=True, exist_ok=True)
+        preview_file = preview_dir / source.name
+        shutil.copy2(source, preview_file)
+    normalized_path = str(preview_file).replace("\\", "/")
+    file_url = "/gradio_api/file=" + quote(normalized_path, safe="/:")
+    return (
+        f'<iframe class="native-pdf-preview" src="{file_url}" '
+        'title="Document Preview"></iframe>'
+    )
+
+
+def prepare_pdf_preview(file_path):
+    """Validate and stage an uploaded PDF in the inline-preview directory."""
+    if not file_path:
+        return pdf_preview_html(None)
+    source = Path(file_path)
+    with source.open("rb") as selected_file:
+        if selected_file.read(4) != b"%PDF":
+            raise gr.Error("The selected file is not a valid PDF")
+    return pdf_preview_html(source)
+
+
+LANGUAGE_MARKERS = {
+    "German": {"der", "die", "das", "und", "ist", "mit", "für", "von", "auf", "ein", "eine", "nicht"},
+    "English": {"the", "and", "is", "with", "for", "from", "this", "that", "not", "are", "of", "to"},
+    "French": {"le", "la", "les", "et", "est", "avec", "pour", "des", "une", "dans", "pas", "du"},
+    "Spanish": {"el", "la", "los", "las", "y", "es", "con", "para", "una", "del", "por", "no"},
+    "Italian": {"il", "la", "gli", "le", "e", "è", "con", "per", "una", "del", "non", "di"},
+}
+
+
+def detect_document_language(text: str) -> tuple[str, str]:
+    """Detect a supported source language without a network dependency."""
+    if re.search(r"[\u3040-\u30ff]", text):
+        return "Japanese", "high"
+    if re.search(r"[\uac00-\ud7af]", text):
+        return "Korean", "high"
+    if re.search(r"[\u4e00-\u9fff]", text):
+        return "Simplified Chinese", "high"
+    if re.search(r"[\u0400-\u04ff]", text):
+        return "Russian", "high"
+
+    words = re.findall(r"[^\W\d_]+", text.lower(), flags=re.UNICODE)
+    scores = {
+        language: sum(word in markers for word in words)
+        for language, markers in LANGUAGE_MARKERS.items()
+    }
+    language, score = max(scores.items(), key=lambda item: item[1])
+    if language == "German":
+        score += len(re.findall(r"[äöüß]", text.lower()))
+    confidence = "high" if score >= 12 else "medium" if score >= 4 else "low"
+    return language, confidence
+
+
+def analyze_pdf_upload(file_path):
+    """Build the preview and recommend settings from PDF content/layout."""
+    preview_html = prepare_pdf_preview(file_path)
+    source = Path(str(file_path)).resolve()
+
+    import pymupdf
+
+    with pymupdf.open(source) as document:
+        sampled_pages = min(document.page_count, 10)
+        text_parts = []
+        font_names = set()
+        toc_entries = 0
+        code_lines = 0
+        dense_pages = 0
+        scanned_pages = 0
+
+        for page_number in range(sampled_pages):
+            page = document[page_number]
+            page_text = page.get_text("text")
+            text_parts.append(page_text)
+            toc_entries += len(
+                re.findall(r"\.{5,}\s*\d+\s*$", page_text, flags=re.MULTILINE)
+            )
+            code_lines += len(
+                re.findall(r"^\s*N\d+\s+(?:G|M)\d+", page_text, flags=re.MULTILINE)
+            )
+            if len(page.get_text("blocks")) >= 35:
+                dense_pages += 1
+            if len(page_text.strip()) < 50 and page.get_images(full=True):
+                scanned_pages += 1
+            for block in page.get_text("dict").get("blocks", []):
+                for line in block.get("lines", []):
+                    for span in line.get("spans", []):
+                        if span.get("font"):
+                            font_names.add(span["font"])
+
+        page_count = document.page_count
+
+    detected_language, confidence = detect_document_language("\n".join(text_parts))
+    risks = []
+    recommendations = []
+    if toc_entries >= 3:
+        risks.append(f"table of contents / dot leaders ({toc_entries} entries)")
+        recommendations.append("TOC protection: enabled")
+    if code_lines >= 3:
+        risks.append(f"preformatted/code listing ({code_lines} lines)")
+        recommendations.append("Code-line positioning protection: enabled")
+    if len(font_names) >= 6:
+        risks.append(f"mixed typography ({len(font_names)} fonts)")
+    if dense_pages:
+        risks.append(f"dense positioned text ({dense_pages} sampled page(s))")
+    if scanned_pages:
+        risks.append(f"image-only/scanned content ({scanned_pages} sampled page(s))")
+        recommendations.append("OCR is required for scanned pages")
+
+    available_modes = KernelRegistry.available()
+    recommended_mode = "precise" if risks and "precise" in available_modes else "fast"
+    if recommended_mode == "fast" and risks:
+        recommendations.append("Translation Mode: fast (layout protection is automatic)")
+    else:
+        recommendations.append(f"Mode: {recommended_mode}")
+    recommendations.append("Skip font subsetting: off")
+
+    risk_summary = ", ".join(risks) if risks else "no major layout risks detected"
+    report = (
+        "### Document analysis\n"
+        f"- **Detected source:** {detected_language} ({confidence} confidence)\n"
+        f"- **Document:** {page_count} page(s); {risk_summary}\n"
+        f"- **Recommended:** {'; '.join(recommendations)}"
+    )
+    return (
+        preview_html,
+        gr.update(value=report, visible=True),
+        gr.update(value=detected_language),
+        gr.update(value=recommended_mode),
+    )
+
+
 # The following variables associate strings with translators
 service_map: dict[str, BaseTranslator] = {
     "Google": GoogleTranslator,
     "Bing": BingTranslator,
-    "DeepL": DeepLTranslator,
     "DeepLX": DeepLXTranslator,
     "Ollama": OllamaTranslator,
     "Xinference": XinferenceTranslator,
-    "AzureOpenAI": AzureOpenAITranslator,
-    "OpenAI": OpenAITranslator,
-    "Zhipu": ZhipuTranslator,
-    "ModelScope": ModelScopeTranslator,
-    "Silicon": SiliconTranslator,
-    "Gemini": GeminiTranslator,
-    "Azure": AzureTranslator,
-    "Tencent": TencentTranslator,
-    "Dify": DifyTranslator,
-    "AnythingLLM": AnythingLLMTranslator,
     "Argos Translate": ArgosTranslator,
-    "Grok": GrokTranslator,
     "Groq": GroqTranslator,
-    "DeepSeek": DeepseekTranslator,
-    "MiniMax": MiniMaxTranslator,
-    "OpenAI-liked": OpenAIlikedTranslator,
-    "Ali Qwen-Translation": QwenMtTranslator,
-    "302.AI": X302AITranslator,
 }
 
 # The following variables associate strings with specific languages
@@ -140,7 +252,6 @@ if ConfigManager.get("PDF2ZH_DEMO"):
 # Limit Enabled Services
 enabled_services: T.Optional[T.List[str]] = ConfigManager.get("ENABLED_SERVICES")
 if isinstance(enabled_services, list):
-    default_services = ["Google", "Bing"]
     enabled_services_names = [str(_).lower().strip() for _ in enabled_services]
     enabled_services = [
         k
@@ -149,7 +260,6 @@ if isinstance(enabled_services, list):
     ]
     if len(enabled_services) == 0:
         raise RuntimeError("No services available.")
-    enabled_services = default_services + enabled_services
 else:
     enabled_services = list(service_map.keys())
 
@@ -235,7 +345,7 @@ def translate_file(
     mode_choice,
     recaptcha_response,
     state,
-    progress=gr.Progress(),
+    progress=gr.Progress(track_tqdm=True),
     *envs,
 ):
     """
@@ -272,14 +382,16 @@ def translate_file(
     if flag_demo and not verify_recaptcha(recaptcha_response):
         raise gr.Error("reCAPTCHA fail")
 
-    progress(0, desc="Starting translation...")
+    progress(0.01, desc="Preparing translation...")
 
-    output = Path("pdf2zh_files")
+    output = Path("pdf2zh_files") / str(session_id)
     output.mkdir(parents=True, exist_ok=True)
 
     if file_type == "File":
         if not file_input:
             raise gr.Error("No input")
+        if Path(file_input).suffix.lower() != ".pdf":
+            raise gr.Error("Only PDF files are supported")
         file_path = shutil.copy(file_input, output)
     else:
         if not link_input:
@@ -290,22 +402,34 @@ def translate_file(
             5 * 1024 * 1024 if flag_demo else None,
         )
 
+    with open(file_path, "rb") as selected_file:
+        is_pdf = selected_file.read(4) == b"%PDF"
+    if not is_pdf:
+        raise gr.Error("The selected file is not a valid PDF")
+
+    progress(0.04, desc="PDF validated. Loading translation resources...")
+
     filename = os.path.splitext(os.path.basename(file_path))[0]
     file_raw = output / f"{filename}.pdf"
     file_mono = output / f"{filename}-mono.pdf"
     file_dual = output / f"{filename}-dual.pdf"
 
+    if service not in service_map:
+        raise gr.Error("Unsupported translation service")
     translator = service_map[service]
     if page_range != "Others":
         selected_page = page_map[page_range]
     else:
         selected_page = []
-        for p in page_input.split(","):
-            if "-" in p:
-                start, end = p.split("-")
-                selected_page.extend(range(int(start) - 1, int(end)))
-            else:
-                selected_page.append(int(p) - 1)
+        try:
+            for p in page_input.split(","):
+                if "-" in p:
+                    start, end = p.split("-", 1)
+                    selected_page.extend(range(int(start) - 1, int(end)))
+                else:
+                    selected_page.append(int(p) - 1)
+        except (AttributeError, ValueError):
+            raise gr.Error("Invalid page range. Use values such as 1,3-5")
     lang_from = lang_map[lang_from]
     lang_to = lang_map[lang_to]
 
@@ -322,39 +446,34 @@ def translate_file(
 
     print(f"Files before translation: {os.listdir(output)}")
 
-    def progress_bar(t: tqdm.tqdm):
-        desc = getattr(t, "desc", "Translating...")
-        if desc == "":
-            desc = "Translating..."
-        progress(t.n / t.total, desc=desc)
+    def progress_bar(update):
+        if isinstance(update, dict):
+            desc = update.get("stage") or "Translating..."
+            fraction = float(
+                update.get("overall_progress", update.get("stage_progress", 0.0))
+            )
+            if fraction > 1:
+                fraction /= 100
+        else:
+            desc = getattr(update, "desc", None) or "Translating..."
+            total = getattr(update, "total", 0) or 0
+            fraction = (getattr(update, "n", 0) / total) if total else 0.0
+        progress(max(0.0, min(1.0, fraction)), desc=desc)
 
     try:
         threads = int(threads)
-    except ValueError:
+    except (TypeError, ValueError):
         threads = 1
 
-    param = {
-        "files": [str(file_raw)],
-        "pages": selected_page,
-        "lang_in": lang_from,
-        "lang_out": lang_to,
-        "service": f"{translator.name}",
-        "output": output,
-        "thread": int(threads),
-        "callback": progress_bar,
-        "cancellation_event": cancellation_event_map[session_id],
-        "envs": _envs,
-        "prompt": Template(prompt) if prompt else None,
-        "skip_subset_fonts": skip_subset_fonts,
-        "ignore_cache": ignore_cache,
-        "vfont": vfont,  # 添加自定义公式字体正则表达式
-        "model": ModelInstance.value,
-    }
-
     try:
-        from pdf2zh.kernel import KernelRegistry
         from pdf2zh.kernel.protocol import TranslateRequest
 
+        available_modes = KernelRegistry.available()
+        if mode_choice not in available_modes:
+            raise RuntimeError(
+                f"Translation mode '{mode_choice}' is not installed. "
+                f"Available mode: {', '.join(available_modes)}"
+            )
         KernelRegistry.switch(mode_choice)
         kernel = KernelRegistry.get()
         request = TranslateRequest(
@@ -371,14 +490,28 @@ def translate_file(
             ignore_cache=ignore_cache,
             vfont=vfont,
         )
-        kernel.translate(
+        progress(0.08, desc="Analyzing PDF layout...")
+        results = kernel.translate(
             request,
             callback=progress_bar,
             cancellation_event=cancellation_event_map[session_id],
         )
+        if results:
+            if results[0].mono_pdf:
+                file_mono = Path(results[0].mono_pdf)
+            if results[0].dual_pdf:
+                file_dual = Path(results[0].dual_pdf)
     except CancelledError:
-        del cancellation_event_map[session_id]
         raise gr.Error("Translation cancelled")
+    except gr.Error:
+        raise
+    except Exception as exc:
+        logger.exception("Translation failed")
+        raise gr.Error(
+            f"Translation failed ({type(exc).__name__}): {exc}"
+        ) from exc
+    finally:
+        cancellation_event_map.pop(session_id, None)
     print(f"Files after translation: {os.listdir(output)}")
 
     if not file_mono.exists() or not file_dual.exists():
@@ -388,7 +521,7 @@ def translate_file(
 
     return (
         str(file_mono),
-        str(file_mono),
+        pdf_preview_html(file_mono),
         str(file_dual),
         gr.update(visible=True),
         gr.update(visible=True),
@@ -406,27 +539,11 @@ def babeldoc_translate_file(**kwargs):
     for translator in [
         GoogleTranslator,
         BingTranslator,
-        DeepLTranslator,
         DeepLXTranslator,
         OllamaTranslator,
         XinferenceTranslator,
-        AzureOpenAITranslator,
-        OpenAITranslator,
-        ZhipuTranslator,
-        ModelScopeTranslator,
-        SiliconTranslator,
-        GeminiTranslator,
-        AzureTranslator,
-        TencentTranslator,
-        DifyTranslator,
-        AnythingLLMTranslator,
         ArgosTranslator,
-        GrokTranslator,
         GroqTranslator,
-        DeepseekTranslator,
-        OpenAIlikedTranslator,
-        QwenMtTranslator,
-        X302AITranslator,
     ]:
         if kwargs["service"] == translator.name:
             translator = translator(
@@ -540,6 +657,24 @@ custom_css = """
     .pdf-canvas canvas {
         width: 100%;
     }
+
+    .native-pdf-preview {
+        width: 100%;
+        height: 2000px;
+        border: 0;
+        border-radius: 8px;
+        background: white;
+    }
+
+    .preview-placeholder {
+        min-height: 240px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        color: #777;
+        border: 1px dashed #bbb;
+        border-radius: 8px;
+    }
     """
 
 demo_recaptcha = """
@@ -553,29 +688,30 @@ demo_recaptcha = """
     </script>
     """
 
-tech_details_string = f"""
-                    <summary>Technical details</summary>
-                    - GitHub: <a href="https://github.com/Byaidu/PDFMathTranslate">Byaidu/PDFMathTranslate</a><br>
-                    - BabelDOC: <a href="https://github.com/funstory-ai/BabelDOC">funstory-ai/BabelDOC</a><br>
-                    - GUI by: <a href="https://github.com/reycn">Rongxin</a><br>
-                    - pdf2zh Version: {__version__} <br>
-                    - BabelDOC Version: {babeldoc_version}
-                """
 cancellation_event_map = {}
 
 
 # The following code creates the GUI
 with gr.Blocks(
-    title="PDFMathTranslate - PDF Translation with preserved formats",
+    title="PDF Translator",
     theme=gr.themes.Default(
-        primary_hue=custom_blue, spacing_size="md", radius_size="lg"
+        primary_hue=custom_blue,
+        spacing_size="md",
+        radius_size="lg",
+        font=(
+            gr.themes.Font("Segoe UI"),
+            gr.themes.Font("Arial"),
+            gr.themes.Font("sans-serif"),
+        ),
+        font_mono=(
+            gr.themes.Font("Consolas"),
+            gr.themes.Font("monospace"),
+        ),
     ),
     css=custom_css,
     head=demo_recaptcha if flag_demo else "",
 ) as demo:
-    gr.Markdown(
-        "# [PDFMathTranslate @ GitHub](https://github.com/Byaidu/PDFMathTranslate)"
-    )
+    gr.Markdown("# PDF Translator")
 
     with gr.Row():
         with gr.Column(scale=1):
@@ -588,10 +724,11 @@ with gr.Blocks(
             file_input = gr.File(
                 label="File",
                 file_count="single",
-                file_types=[".pdf", ".doc", ".docx"],
+                file_types=[".pdf"],
                 type="filepath",
                 elem_classes=["input-file"],
             )
+            analysis_report = gr.Markdown(visible=False)
             link_input = gr.Textbox(
                 label="Link",
                 visible=False,
@@ -653,10 +790,11 @@ with gr.Blocks(
                 prompt = gr.Textbox(
                     label="Custom Prompt for llm", interactive=True, visible=False
                 )
+                mode_choices = KernelRegistry.available()
                 mode_choice = gr.Dropdown(
                     label="Translation Mode",
-                    choices=["fast", "precise"],
-                    value="fast",
+                    choices=mode_choices,
+                    value="fast" if "fast" in mode_choices else mode_choices[0],
                     interactive=True,
                 )
                 envs.append(prompt)
@@ -719,21 +857,33 @@ with gr.Blocks(
             recaptcha_box = gr.HTML('<div id="recaptcha-box"></div>')
             translate_btn = gr.Button("Translate", variant="primary")
             cancellation_btn = gr.Button("Cancel", variant="secondary")
-            tech_details_tog = gr.Markdown(
-                tech_details_string,
-                elem_classes=["secondary-text"],
+            page_range.select(
+                on_select_page,
+                page_range,
+                page_input,
+                queue=False,
+                show_progress="hidden",
             )
-            page_range.select(on_select_page, page_range, page_input)
             service.select(
                 on_select_service,
                 service,
                 envs,
+                queue=False,
+                show_progress="hidden",
             )
-            vfont.change(on_vfont_change, inputs=vfont, outputs=None)
+            vfont.change(
+                on_vfont_change,
+                inputs=vfont,
+                outputs=None,
+                queue=False,
+                show_progress="hidden",
+            )
             file_type.select(
                 on_select_filetype,
                 file_type,
                 [file_input, link_input],
+                queue=False,
+                show_progress="hidden",
                 js=(
                     f"""
                     (a,b)=>{{
@@ -753,28 +903,19 @@ with gr.Blocks(
 
         with gr.Column(scale=2):
             gr.Markdown("## Preview")
-            preview = PDF(label="Document Preview", visible=True, height=2000)
+            preview = gr.HTML(
+                value=pdf_preview_html(None),
+                label="Document Preview",
+                visible=True,
+            )
 
     # Event handlers
     file_input.upload(
-        lambda x: x,
+        analyze_pdf_upload,
         inputs=file_input,
-        outputs=preview,
-        js=(
-            f"""
-            (a,b)=>{{
-                try{{
-                    grecaptcha.render('recaptcha-box',{{
-                        'sitekey':'{client_key}',
-                        'callback':'onVerify'
-                    }});
-                }}catch(error){{}}
-                return [a];
-            }}
-            """
-            if flag_demo
-            else ""
-        ),
+        outputs=[preview, analysis_report, lang_from, mode_choice],
+        queue=False,
+        show_progress="hidden",
     )
 
     state = gr.State({"session_id": None})
@@ -813,7 +954,13 @@ with gr.Blocks(
     cancellation_btn.click(
         stop_translate_file,
         inputs=[state],
+        queue=False,
+        show_progress="hidden",
     )
+
+
+# Translation and other server-side callbacks use Gradio's event queue.
+demo.queue(default_concurrency_limit=1)
 
 
 def parse_user_passwd(file_path: str) -> tuple:
@@ -846,16 +993,6 @@ def parse_user_passwd(file_path: str) -> tuple:
     return tuple_list, content
 
 
-def _has_ipv6() -> bool:
-    """Check whether the system can bind an IPv6 socket."""
-    try:
-        sock = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
-        sock.close()
-        return True
-    except OSError:
-        return False
-
-
 def setup_gui(
     share: bool = False, auth_file: list = ["", ""], server_port=7860
 ) -> None:
@@ -875,42 +1012,34 @@ def setup_gui(
     if len(user_list) > 0:
         auth_kwargs = {"auth": user_list, "auth_message": html}
 
+    PREVIEW_ROOT.mkdir(parents=True, exist_ok=True)
+    inline_pdf_paths = [str(PREVIEW_ROOT.resolve())]
+
     if flag_demo:
-        demo.launch(server_name="0.0.0.0", max_file_size="5mb", inbrowser=True)
+        demo.launch(
+            server_name="0.0.0.0",
+            max_file_size="5mb",
+            inbrowser=True,
+            allowed_paths=inline_pdf_paths,
+        )
         return
 
-    # Try binding addresses in order: "::" accepts both IPv4+IPv6 on most
-    # dual-stack systems, "0.0.0.0" is IPv4-only, "127.0.0.1" is loopback,
-    # and finally fall back to Gradio's share mode.
-    bind_addresses = []
-    if _has_ipv6():
-        bind_addresses.append("[::]")
-    bind_addresses.append("0.0.0.0")
-    bind_addresses.append("127.0.0.1")
+    # Ensure Gradio's own localhost health check bypasses system proxies. A
+    # single launch keeps the queue worker from being torn down by retries.
+    local_hosts = "localhost,127.0.0.1,::1"
+    for proxy_bypass_var in ("NO_PROXY", "no_proxy"):
+        existing = os.environ.get(proxy_bypass_var, "")
+        entries = [value for value in (existing, local_hosts) if value]
+        os.environ[proxy_bypass_var] = ",".join(entries)
 
-    for addr in bind_addresses:
-        try:
-            demo.launch(
-                server_name=addr,
-                debug=True,
-                inbrowser=True,
-                share=share,
-                server_port=server_port,
-                **auth_kwargs,
-            )
-            return
-        except Exception:
-            print(
-                f"Error launching GUI using {addr}.\n"
-                "This may be caused by global mode of proxy software."
-            )
-
-    # Last resort: let Gradio create a share link
     demo.launch(
+        server_name="127.0.0.1",
         debug=True,
         inbrowser=True,
-        share=True,
+        share=share,
         server_port=server_port,
+        allowed_paths=inline_pdf_paths,
+        show_error=True,
         **auth_kwargs,
     )
 

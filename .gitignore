@@ -10,6 +10,8 @@ gradio_files
 tmp
 gui/gradio_files
 gui/tmp
+.gradio/
+scratch_launch.py
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

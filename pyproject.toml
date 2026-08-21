@@ -30,7 +30,6 @@ dependencies = [
     "opencv-python-headless",
     "tencentcloud-sdk-python-tmt",
     "pdfminer-six==20250416",
-    "gradio_pdf>=0.0.21",
     "pikepdf",
     "peewee>=3.17.8",
     "fontTools",
